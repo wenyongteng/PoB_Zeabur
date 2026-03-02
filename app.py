@@ -1135,7 +1135,7 @@ Use Chinese primarily for output."""
 _active_pob = None
 _background_task = None
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def get_index():
     """返回 HTML 页面"""
     return HTMLResponse(content=HTML_CONTENT)
@@ -1163,19 +1163,16 @@ async def websocket_endpoint(websocket: WebSocket):
         pob = _active_pob
         pob.websocket = websocket
 
-        # 发送历史记录到前端
-        if hasattr(pob, 'history_content') and pob.history_content:
-            lines = pob.history_content.split('\n')
-            line_count = len(lines)
-            char_count = len(pob.history_content)
-            human_count = pob.history_content.count('[Human ') + pob.history_content.count('**User - --**')
-            ai_count = pob.history_content.count('[AI ') + pob.history_content.count('**Assistant - --**')
-            await pob.send_message("status", f"📚 历史记录加载完成: {char_count:,} 字符, {line_count:,} 行, {human_count} 条人类消息, {ai_count} 条AI输出")
+        # 发送当前意识流（实时状态，不是启动时的旧快照）
+        current_content = "".join(pob.consciousness)
+        if current_content:
+            char_count = len(current_content)
+            await pob.send_message("status", f"🔄 已连接到后台 PoB ({char_count:,} 字符意识流)")
             display_limit = 50000
-            if len(pob.history_content) > display_limit:
-                display_content = "...(历史过长，只显示最后部分)...\n\n" + pob.history_content[-display_limit:]
+            if len(current_content) > display_limit:
+                display_content = "...(历史过长，只显示最后部分)...\n\n" + current_content[-display_limit:]
             else:
-                display_content = pob.history_content
+                display_content = current_content
             await pob.send_message("history_raw", f"### 📜 历史意识流\n\n---\n\n{display_content}\n\n---\n")
             await asyncio.sleep(0.5)
         else:
@@ -1201,7 +1198,9 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             print(f"[ERROR] WebSocket error: {e}")
         finally:
-            pob.websocket = None  # 摘除 websocket，循环继续
+            # 只清除自己，不影响后续新连接
+            if pob.websocket is websocket:
+                pob.websocket = None
     else:
         # 普通模式：PoB 生命周期绑定 WebSocket
         if _active_pob is not None:

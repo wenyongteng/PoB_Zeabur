@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+venv/
+vision/*.jpg
+vision/*.png
+vision/*.gif
+vision/*.webp
+cache_state.json
+*.log

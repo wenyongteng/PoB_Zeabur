@@ -39,7 +39,8 @@ import uvicorn
 from compress_memory import parse_multimodal_segment
 
 # 配置
-LOG_FILE = 'consciousness.txt'
+DATA_DIR = os.getenv('DATA_DIR', os.path.dirname(os.path.abspath(__file__)))  # 数据目录，挂载持久卷
+LOG_FILE = os.path.join(DATA_DIR, 'consciousness.txt')
 MODEL = os.getenv('MODEL', 'gemini-3-pro-preview')
 API_KEY = os.getenv('GOOGLE_API_KEY')
 # Proxy
@@ -50,19 +51,18 @@ BASE_URL = os.getenv('BASE_URL', 'https://openrouter.ai/api/v1') # Not used for 
 LOOP_SEC = int(os.getenv('LOOP_SEC', 10))
 AUTO_RUN = int(os.getenv('AUTO_RUN', 0))  # 1=后台自动运行，0=仅网页打开时运行
 BUFFER_LIMIT = 20000  # 2万字符后重建 Cache
-CACHE_STATE_FILE = os.path.join(os.path.dirname(__file__), "cache_state.json")
+CACHE_STATE_FILE = os.path.join(DATA_DIR, "cache_state.json")
 
 # 初始化 FastAPI
 app = FastAPI()
 
 # 挂载 vision 目录
-base_dir = os.path.dirname(os.path.abspath(CACHE_STATE_FILE))
-vision_dir = os.path.join(base_dir, "vision")
+vision_dir = os.path.join(DATA_DIR, "vision")
 os.makedirs(vision_dir, exist_ok=True)
 app.mount("/vision", StaticFiles(directory=vision_dir), name="vision")
 
 # 挂载 uploads 目录 (临时)
-uploads_dir = os.path.join(base_dir, "uploads")
+uploads_dir = os.path.join(DATA_DIR, "uploads")
 os.makedirs(uploads_dir, exist_ok=True)
 # app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads") # 可选，如果前端需要直接预览上传前的图
 
@@ -178,10 +178,10 @@ class PoB:
         """后台执行记忆压缩（保留压缩期间的增量）"""
         if not self.running: return  # 实例已停止
         import subprocess
-        script_dir = os.path.dirname(os.path.abspath(LOG_FILE))
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         script_path = os.path.join(script_dir, "compress_memory.py")
-        old_file = os.path.join(script_dir, "consciousness.txt")
-        new_file = os.path.join(script_dir, "consciousness.txt.new")
+        old_file = os.path.join(DATA_DIR, "consciousness.txt")
+        new_file = os.path.join(DATA_DIR, "consciousness.txt.new")
         
         if not os.path.exists(script_path):
             print("[Compress] Script not found")
@@ -193,8 +193,10 @@ class PoB:
         print(f"[Compress] Starting compression, file size: {start_len:,} bytes")
         
         try:
-            result = subprocess.run(["python3", script_path], 
-                                   cwd=script_dir, capture_output=True, text=True, timeout=600)
+            env = os.environ.copy()
+            env['DATA_DIR'] = DATA_DIR
+            result = subprocess.run(["python3", script_path],
+                                   cwd=script_dir, env=env, capture_output=True, text=True, timeout=600)
             
             # 打印压缩脚本的日志
             if result.stdout:

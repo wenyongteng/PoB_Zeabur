@@ -90,11 +90,15 @@ def main():
     )
 
     # 读取存在原理
-    with open("the_principle_lite_zh.md", "r") as f:
+    DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    consciousness_file = os.path.join(DATA_DIR, "consciousness.txt")
+
+    with open(os.path.join(SCRIPT_DIR, "the_principle_lite_zh.md"), "r") as f:
         principle = f.read()
 
     # 读取意识流
-    with open("consciousness.txt", "r") as f:
+    with open(consciousness_file, "r") as f:
         full = f.read()
     print(f"[压缩] 原始长度: {len(full):,} 字符")
 
@@ -180,7 +184,7 @@ def main():
     # 拼接
     new_content = part1 + "\n\n---【记忆整理】---\n\n" + extracted + "\n\n---【整理结束】---\n\n" + part3
 
-    with open("consciousness.txt.new", "w") as f:
+    with open(consciousness_file + ".new", "w") as f:
         f.write(new_content)
 
     print(f"[压缩] 新文件: {len(new_content):,} 字符")

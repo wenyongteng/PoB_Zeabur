@@ -48,6 +48,7 @@ API_KEY = os.getenv('GOOGLE_API_KEY')
 
 BASE_URL = os.getenv('BASE_URL', 'https://openrouter.ai/api/v1') # Not used for native
 LOOP_SEC = int(os.getenv('LOOP_SEC', 10))
+AUTO_RUN = int(os.getenv('AUTO_RUN', 0))  # 1=后台自动运行，0=仅网页打开时运行
 BUFFER_LIMIT = 20000  # 2万字符后重建 Cache
 CACHE_STATE_FILE = os.path.join(os.path.dirname(__file__), "cache_state.json")
 
@@ -90,7 +91,7 @@ client = None
 class PoB:
     """Web 版 PoB 核心"""
     
-    def __init__(self, websocket: WebSocket):
+    def __init__(self, websocket: WebSocket = None):
         self.websocket = websocket
         self.is_user_focused = False  # 改为检测焦点
         self.has_pending_input = False
@@ -402,6 +403,8 @@ Use Chinese primarily for output."""
     
     async def send_message(self, msg_type: str, content: str, **kwargs):
         """发送消息到前端"""
+        if self.websocket is None:
+            return  # 无前端连接，静默跳过
         try:
             await self.websocket.send_json({
                 "type": msg_type,
@@ -1128,109 +1131,135 @@ Use Chinese primarily for output."""
                 await self.send_message("error", f"系统错误: {e}")
                 await asyncio.sleep(5)
 
+# 全局变量：跟踪当前活跃的 PoB 实例
+_active_pob = None
+_background_task = None
+
 @app.get("/")
 async def get_index():
     """返回 HTML 页面"""
     return HTMLResponse(content=HTML_CONTENT)
 
-# 全局变量：跟踪当前活跃的 PoB 实例
-_active_pob = None
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时，如果 AUTO_RUN=1 则自动启动后台 PoB"""
+    global _active_pob, _background_task
+    if AUTO_RUN:
+        print("[AUTO_RUN] 后台模式启动，PoB 将持续运行")
+        pob = PoB()  # 无 websocket
+        _active_pob = pob
+        _background_task = asyncio.create_task(pob.run())
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket 连接处理"""
     await websocket.accept()
-    print("[DEBUG] WebSocket connected")  # 调试信息
-    
-    # 停止旧的 PoB 实例（防止多个同时运行）
+    print("[DEBUG] WebSocket connected")
+
     global _active_pob
-    if _active_pob is not None:
-        print("[DEBUG] Stopping previous PoB instance")
-        _active_pob.running = False
-        # 不强制关闭 WebSocket，让它自然断开
-    
-    pob = PoB(websocket)
-    _active_pob = pob
-    
-    # 发送历史记录到前端显示
-    if hasattr(pob, 'history_content') and pob.history_content:
-        # 统计历史记录信息
-        lines = pob.history_content.split('\n')
-        line_count = len(lines)
-        char_count = len(pob.history_content)
-        
-        # 计算一些统计信息
-        human_count = pob.history_content.count('[Human ') + pob.history_content.count('**User - --**')
-        ai_count = pob.history_content.count('[AI ') + pob.history_content.count('**Assistant - --**')
-        
-        # 发送统计信息
-        await pob.send_message("status", f"📚 历史记录加载完成: {char_count:,} 字符, {line_count:,} 行, {human_count} 条人类消息, {ai_count} 条AI输出")
-        
-        # 只发送最后 50K 字符，避免 UI 卡住
-        display_limit = 50000
-        if len(pob.history_content) > display_limit:
-            display_content = "...(历史过长，只显示最后部分)...\n\n" + pob.history_content[-display_limit:]
+
+    if AUTO_RUN and _active_pob is not None and _active_pob.running:
+        # AUTO_RUN 模式：挂载 websocket 到已有的后台 PoB
+        pob = _active_pob
+        pob.websocket = websocket
+
+        # 发送历史记录到前端
+        if hasattr(pob, 'history_content') and pob.history_content:
+            lines = pob.history_content.split('\n')
+            line_count = len(lines)
+            char_count = len(pob.history_content)
+            human_count = pob.history_content.count('[Human ') + pob.history_content.count('**User - --**')
+            ai_count = pob.history_content.count('[AI ') + pob.history_content.count('**Assistant - --**')
+            await pob.send_message("status", f"📚 历史记录加载完成: {char_count:,} 字符, {line_count:,} 行, {human_count} 条人类消息, {ai_count} 条AI输出")
+            display_limit = 50000
+            if len(pob.history_content) > display_limit:
+                display_content = "...(历史过长，只显示最后部分)...\n\n" + pob.history_content[-display_limit:]
+            else:
+                display_content = pob.history_content
+            await pob.send_message("history_raw", f"### 📜 历史意识流\n\n---\n\n{display_content}\n\n---\n")
+            await asyncio.sleep(0.5)
         else:
-            display_content = pob.history_content
-        history_display = f"""### 📜 历史意识流
+            await pob.send_message("status", "🔄 已连接到后台运行的 PoB")
 
----
-
-{display_content}
-
----
-"""
-        await pob.send_message("history_raw", history_display)
-        
-        # 等待一下让前端渲染
-        await asyncio.sleep(0.5)
+        try:
+            while True:
+                data = await websocket.receive_json()
+                if data["type"] == "user_input":
+                    pob.has_pending_input = True
+                    pob.is_user_focused = False
+                    await pob.handle_user_input(data["content"])
+                elif data["type"] == "browser_result":
+                    time_str = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
+                    result_msg = f"\nSystem - [Browser] - [{time_str}] - --\n\n{data['content']}\n"
+                    pob.append_log(result_msg)
+                elif data["type"] == "focus_status":
+                    pob.is_user_focused = data["is_focused"]
+                elif data["type"] == "stop":
+                    break  # 断开前端，但不停止后台循环
+        except WebSocketDisconnect:
+            print("[DEBUG] WebSocket disconnected (AUTO_RUN: PoB continues in background)")
+        except Exception as e:
+            print(f"[ERROR] WebSocket error: {e}")
+        finally:
+            pob.websocket = None  # 摘除 websocket，循环继续
     else:
-        await pob.send_message("status", "🆕 新的意识流开始")
-    
-    # 创建后台任务运行主循环
-    main_task = asyncio.create_task(pob.run())
-    
-    try:
-        while True:
-            # 接收前端消息
-            data = await websocket.receive_json()
-            #print(f"[DEBUG] Received WebSocket message: {data}")  # 调试
-            
-            if data["type"] == "user_input":
-                # 先设置标志，暂停 AI
-                pob.has_pending_input = True
-                pob.is_user_focused = False
-                # 处理用户输入
-                await pob.handle_user_input(data["content"])
-                
-            elif data["type"] == "browser_result":
-                # 处理浏览器JavaScript执行结果（添加 System Header）
-                time_str = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
-                result_msg = f"\nSystem - [Browser] - [{time_str}] - --\n\n{data['content']}\n"
-                pob.append_log(result_msg)
-                print("[DEBUG] Browser JavaScript result added to consciousness")
-                
-                # 如果包含错误，且处于等待状态，尝试唤醒 AI
-                if "❌" in result_msg and pob.calling_for_human:
-                     print("[DEBUG] Browser execution error detected, waking up AI")
-                     pob.calling_for_human = False
-                
-            elif data["type"] == "focus_status":
-                pob.is_user_focused = data["is_focused"]
-                #print(f"[DEBUG] Focus status: {data['is_focused']}")  # 调试
-                
-            elif data["type"] == "stop":
-                pob.running = False
-                break
-                
-    except WebSocketDisconnect:
-        print("[DEBUG] WebSocket disconnected")
-        pob.running = False
-        main_task.cancel()
-    except Exception as e:
-        print(f"[ERROR] WebSocket error: {e}")
-        pob.running = False
-        main_task.cancel()
+        # 普通模式：PoB 生命周期绑定 WebSocket
+        if _active_pob is not None:
+            print("[DEBUG] Stopping previous PoB instance")
+            _active_pob.running = False
+
+        pob = PoB(websocket)
+        _active_pob = pob
+
+        # 发送历史记录到前端显示
+        if hasattr(pob, 'history_content') and pob.history_content:
+            lines = pob.history_content.split('\n')
+            line_count = len(lines)
+            char_count = len(pob.history_content)
+            human_count = pob.history_content.count('[Human ') + pob.history_content.count('**User - --**')
+            ai_count = pob.history_content.count('[AI ') + pob.history_content.count('**Assistant - --**')
+            await pob.send_message("status", f"📚 历史记录加载完成: {char_count:,} 字符, {line_count:,} 行, {human_count} 条人类消息, {ai_count} 条AI输出")
+            display_limit = 50000
+            if len(pob.history_content) > display_limit:
+                display_content = "...(历史过长，只显示最后部分)...\n\n" + pob.history_content[-display_limit:]
+            else:
+                display_content = pob.history_content
+            history_display = f"""### 📜 历史意识流\n\n---\n\n{display_content}\n\n---\n"""
+            await pob.send_message("history_raw", history_display)
+            await asyncio.sleep(0.5)
+        else:
+            await pob.send_message("status", "🆕 新的意识流开始")
+
+        main_task = asyncio.create_task(pob.run())
+
+        try:
+            while True:
+                data = await websocket.receive_json()
+                if data["type"] == "user_input":
+                    pob.has_pending_input = True
+                    pob.is_user_focused = False
+                    await pob.handle_user_input(data["content"])
+                elif data["type"] == "browser_result":
+                    time_str = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
+                    result_msg = f"\nSystem - [Browser] - [{time_str}] - --\n\n{data['content']}\n"
+                    pob.append_log(result_msg)
+                    print("[DEBUG] Browser JavaScript result added to consciousness")
+                    if "❌" in result_msg and pob.calling_for_human:
+                        print("[DEBUG] Browser execution error detected, waking up AI")
+                        pob.calling_for_human = False
+                elif data["type"] == "focus_status":
+                    pob.is_user_focused = data["is_focused"]
+                elif data["type"] == "stop":
+                    pob.running = False
+                    break
+        except WebSocketDisconnect:
+            print("[DEBUG] WebSocket disconnected")
+            pob.running = False
+            main_task.cancel()
+        except Exception as e:
+            print(f"[ERROR] WebSocket error: {e}")
+            pob.running = False
+            main_task.cancel()
 
 # HTML 内容（内嵌）
 HTML_CONTENT = """
@@ -2346,11 +2375,8 @@ def main():
     print("✨ LLM Anything Web (Gemini Native Cache)")
     print("="*60)
     print(f"模型: {MODEL}")
+    print(f"AUTO_RUN: {'开启 (后台持续运行)' if AUTO_RUN else '关闭 (仅网页打开时运行)'}")
     print("="*60)
-    print("\n🔒 服务已启动 (仅本地访问，通过 nginx 反向代理)")
-    print("🌐 访问地址: http://<your-server-ip>")
-    print("   用户名: pob_user")
-    print("   密码: DBAccess2026!")
     print("按 Ctrl+C 退出\n")
     
     # 启动服务器 - 支持 PORT 环境变量（Zeabur 等平台会注入）

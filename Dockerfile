@@ -24,6 +24,9 @@ COPY public_tools/ ./public_tools/
 # 创建必要目录和文件
 RUN mkdir -p vision && touch consciousness.txt
 
+# 禁用 Python 输出缓冲，确保日志实时显示
+ENV PYTHONUNBUFFERED=1
+
 EXPOSE 8000
 
-CMD ["python3", "app.py"]
+CMD ["python3", "-u", "app.py"]

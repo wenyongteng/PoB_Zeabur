@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 websockets
-anthropic
+google-genai
 Pillow
 numpy
 requests

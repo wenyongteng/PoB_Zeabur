@@ -33,25 +33,20 @@ from collections import deque
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from google import genai
-from google.genai import types
+import anthropic
 import uvicorn
-from compress_memory import parse_multimodal_segment
 
 # 配置
 DATA_DIR = os.getenv('DATA_DIR', os.path.dirname(os.path.abspath(__file__)))  # 数据目录，挂载持久卷
 LOG_FILE = os.path.join(DATA_DIR, 'consciousness.txt')
-MODEL = os.getenv('MODEL', 'gemini-3-pro-preview')
-API_KEY = os.getenv('GOOGLE_API_KEY')
-# Proxy
-#os.environ['http_proxy'] = "http://127.0.0.1:8001"
-#os.environ['https_proxy'] = "http://127.0.0.1:8001"
-
-BASE_URL = os.getenv('BASE_URL', 'https://openrouter.ai/api/v1') # Not used for native
+MODEL = os.getenv('MODEL', 'claude-opus-4-6-20260205-thinking')
+API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+BASE_URL = os.getenv('ANTHROPIC_BASE_URL', 'https://open.coolyeah.net')
 LOOP_SEC = int(os.getenv('LOOP_SEC', 10))
 AUTO_RUN = int(os.getenv('AUTO_RUN', 0))  # 1=后台自动运行，0=仅网页打开时运行
-BUFFER_LIMIT = 20000  # 2万字符后重建 Cache
-CACHE_STATE_FILE = os.path.join(DATA_DIR, "cache_state.json")
+MAX_TOKENS = int(os.getenv('MAX_TOKENS', 16384))
+THINKING_BUDGET = int(os.getenv('THINKING_BUDGET', 10000))
+HUMAN_WAIT_TIMEOUT = int(os.getenv('HUMAN_WAIT_TIMEOUT', 10800))  # 3小时超时
 
 # 初始化 FastAPI
 app = FastAPI()
@@ -103,28 +98,22 @@ class PoB:
         self.browser_tag = "/browser exec\n```javascript"
         self.stop_token = "/__END" + "_OUTPUT__"  # 拆分避免自己被截断
         
-        # Cache 相关状态
-        self.cache_name = None
-        self._cache_refreshing = False
-        self._cache_disabled = False  # 缓存 API 不可用时禁用
+        # 状态
         self._compressing = False  # 压缩状态
-        self.full_history_text = "" # 内存中的完整历史文本副本，用于切片
-        self.cached_length = 0      # 已缓存的字符长度
+        self.full_history_text = "" # 内存中的完整历史文本副本
+        self.cached_length = 0      # 缓存边界：此长度之前的内容加 cache_control
         
         # 从文件读取历史意识流
         self._load_consciousness_history()
     
     def _load_consciousness_history(self):
-        """从文件加载历史意识流并初始化 Cache"""
+        """从文件加载历史意识流"""
         try:
             if os.path.exists(LOG_FILE):
                 with open(LOG_FILE, 'r', encoding='utf-8') as f:
                     content = f.read()
                     if content:
-                        # 使用环境变量 MAX_CHARS，默认 2,000,000 (约 500k-1M Token)
-                        max_chars = int(os.getenv('MAX_CHARS', 20000000))
-                        
-                        # 如果内容超过限制，保留最后的 max_chars
+                        max_chars = int(os.getenv('MAX_CHARS', 800000))
                         if len(content) > max_chars:
                             truncated_content = content[-max_chars:]
                             first_newline = truncated_content.find('\n')
@@ -135,14 +124,11 @@ class PoB:
                             print(f"[DEBUG] Loaded {len(content)} chars from history (MAX_CHARS={max_chars}, truncated)")
                         else:
                             print(f"[DEBUG] Loaded {len(content)} chars from history (Full)")
-                        
+
                         self.full_history_text = content
-                        self.history_content = content  # 兼容旧变量名用于 UI 发送
+                        self.history_content = content
                         self.consciousness.append(content)
-                        
-                        # 尝试恢复 Cache，失败则重建
-                        if not self._try_restore_cache():
-                            self._refresh_cache()
+                        self.cached_length = len(content)
                     else:
                         self._init_empty()
             else:
@@ -156,24 +142,7 @@ class PoB:
         init_msg = "[System] Consciousness stream initialized.\n"
         self.consciousness.append(init_msg)
         self.full_history_text = init_msg
-        self._refresh_cache()
-
-    def _try_restore_cache(self):
-        """尝试复用上次的 Cache"""
-        global client
-        try:
-            if not client or not os.path.exists(CACHE_STATE_FILE): return False
-            state = __import__('json').load(open(CACHE_STATE_FILE))
-            if len(self.full_history_text) < state.get('cached_length', 0): return False
-            # 跳过网络验证，直接信任本地文件（推理失败时会自动重建）
-            self.cache_name, self.cached_length = state['cache_name'], state['cached_length']
-            print(f"[System] Trying to load cache: {self.cache_name}")
-            return True
-        except: return False
-
-    def _save_cache_state(self):
-        if self.cache_name:
-            __import__('json').dump({'cache_name': self.cache_name, 'cached_length': self.cached_length}, open(CACHE_STATE_FILE, 'w'))
+        self.cached_length = 0
 
     def _run_compress(self):
         """后台执行记忆压缩（保留压缩期间的增量）"""
@@ -224,8 +193,20 @@ class PoB:
                 
                 print(f"[Compress] Replaced! Final size: {len(compressed) + len(delta):,} chars")
                 os.remove(new_file)  # 清理 .new 文件
-                # 同步重建 cache（不用后台线程，避免竞态）
-                self._do_refresh_cache(reload_memory=True)
+
+                # 重新加载内存中的历史文本
+                if os.path.exists(LOG_FILE):
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        full_content = f.read()
+                        max_chars = int(os.getenv('MAX_CHARS', 800000))
+                        if len(full_content) > max_chars:
+                            truncated = full_content[-max_chars:]
+                            first_newline = truncated.find('\n')
+                            self.full_history_text = truncated[first_newline+1:] if first_newline != -1 else truncated
+                        else:
+                            self.full_history_text = full_content
+                    self.cached_length = len(self.full_history_text)
+                    print(f"[Compress] Memory reloaded, cached_length reset to {self.cached_length}")
             else:
                 print(f"[Compress] Failed: {result.stderr[:200] if result.stderr else 'No .new file'}")
         except Exception as e:
@@ -285,105 +266,10 @@ Everything you print gets appended verbatim to the consciousness log and becomes
 
 Use Chinese primarily for output."""
 
-    def _refresh_cache(self):
-        """后台刷新云端 Cache"""
-        if self._cache_disabled: return  # 缓存 API 不可用，跳过
-        if self._cache_refreshing: return  # 防止重复建
-        if not self.running: return  # 实例已停止
-        self._cache_refreshing = True
-        threading.Thread(target=self._do_refresh_cache, args=(False,), daemon=True).start()
-    
-    def _do_refresh_cache(self, reload_memory=False):
-        """实际执行 cache 刷新 - 每次从硬盘读取最新内容"""
-        if not self.running: return  # 实例已停止
-        global client
-        if not client: return
-        old_cache_name = self.cache_name  # 保存旧名字
-        
-        # 从硬盘读取最新内容
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                disk_content = f.read()
-                max_chars = int(os.getenv('MAX_CHARS', 20000000))
-                # 应用和 _load_consciousness_history 相同的截断逻辑，避免截断在行中间
-                if max_chars and len(disk_content) > max_chars:
-                    truncated_content = disk_content[-max_chars:]
-                    first_newline = truncated_content.find('\n')
-                    if first_newline != -1:
-                        disk_content = truncated_content[first_newline+1:]
-                    else:
-                        disk_content = truncated_content
-        else:
-            disk_content = ""
-        
-        # 内容太短时跳过 cache 创建
-        if len(disk_content) < 1024:
-            print(f"[System] Content too short ({len(disk_content)} chars), skipping cache")
-            self.cache_name = None
-            return
-        
-        try:
-            print(f"[System] Creating cache with {len(disk_content)} chars...")
-            
-            # 解析多模态内容
-            if disk_content:
-                parts = parse_multimodal_segment(disk_content)
-                contents = [types.Content(role='user', parts=parts)]
-            else:
-                contents = []
-            
-            system_instruction = self.get_system_instruction()
-            
-            cache = client.caches.create(
-                model=MODEL,
-                config=types.CreateCachedContentConfig(
-                    display_name="pob_consciousness",
-                    system_instruction=system_instruction,
-                    contents=contents,
-                    ttl="3600s"
-                )
-            )
-            self.cache_name = cache.name
-            if reload_memory:
-                # 再次读取硬盘，以包含 API 等待期间可能产生的新增量
-                if os.path.exists(LOG_FILE):
-                    with open(LOG_FILE, "r", encoding="utf-8") as f:
-                        full_content = f.read()
-                        max_chars = int(os.getenv('MAX_CHARS', 20000000))
-                        if max_chars and len(full_content) > max_chars:
-                            # 应用和 disk_content 相同的截断逻辑
-                            truncated = full_content[-max_chars:]
-                            first_newline = truncated.find('\n')
-                            if first_newline != -1:
-                                self.full_history_text = truncated[first_newline+1:]
-                            else:
-                                self.full_history_text = truncated
-                        else:
-                            self.full_history_text = full_content
-                else:
-                    self.full_history_text = disk_content
-                # 使用 self.full_history_text 的长度，因为 infer 方法用它来切片
-                self.cached_length = len(self.full_history_text)
-            else:
-                # 非 reload 模式，使用 disk_content 的长度
-                self.cached_length = len(disk_content)
-            print(f"[System] Cache created: {self.cache_name}")
-            self._save_cache_state()
-            # 删除旧 Cache（新的已就绪）
-            if old_cache_name:
-                try: client.caches.delete(name=old_cache_name)
-                except: pass
-            
-        except Exception as e:
-            print(f"[Cache] 缓存 API 不可用，降级为直接发送模式: {e}")
-            self.cache_name = None
-            self.cached_length = 0
-            # 404 / Route not found 说明代理不支持缓存 API，永久禁用
-            if "404" in str(e) or "not found" in str(e).lower() or "Not Found" in str(e):
-                self._cache_disabled = True
-                print("[Cache] 已禁用缓存（代理不支持 cachedContents API）")
-        finally:
-            self._cache_refreshing = False
+    def _rotate_cache_boundary(self):
+        """推进缓存边界到当前历史末尾"""
+        self.cached_length = len(self.full_history_text)
+        print(f"[Cache] Boundary advanced to {self.cached_length:,} chars")
 
     def append_log(self, content: str):
         """统一写入日志和内存，确保一致性"""
@@ -879,161 +765,167 @@ Use Chinese primarily for output."""
 
         return "".join(action_results)
     
+    def _strip_image_markers(self, text: str) -> str:
+        """移除 <<<IMAGE:path>>> 标记，替换为文字说明"""
+        import re
+        return re.sub(r'<<<IMAGE:(.*?)>>>', r'[Image: \1]', text)
+
     async def infer(self, context: str) -> str:
-        """AI 推理 (Gemini Native)"""
+        """AI 推理 (Anthropic SDK with cache_control)"""
         global client
         if not context or not client:
             return ""
-        
-        # 用户焦点时暂停
+
         if self.is_user_focused or self.has_pending_input:
             return ""
-        
+
         await self.send_message("status", "AI 思考中...")
-        
-        # 增加重试机制
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # 构建 Prompt：只取 Cache 之后的增量部分 (Buffer)
-                # context 参数是全量历史，我们用 self.cached_length 来切片
-                if self.cached_length > len(self.full_history_text):
-                     print(f"[Warning] Cache ({self.cached_length}) > History ({len(self.full_history_text)}). Sending empty buffer.")
-                
-                # Python 切片特性：如果 start 超过长度，返回空字符串，不会报错
-                # 这样即使 history < cached_length，我们也只是发送空 buffer，避免了发送 Full Text 导致的 Token 爆炸
-                buffer_text = self.full_history_text[self.cached_length:]
-                
-                time_str = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
-                raw_prompt_text = f"{buffer_text}\n\n-------I am a split line for old consciousness stream and new generated contents-------\n\nInstruction: 1. Above is your old consciousness stream. 2. Please output your thoughts and actions. 3. End with {self.stop_token} when complete.\n\n**Assistant - [{time_str}(Current Time)] - --**\n"
-            
-                # 解析多模态 Prompt
-                prompt_contents = parse_multimodal_segment(raw_prompt_text)
-            
-                # 调用 API - 使用流式输出
-                # 配置：使用 Cache
-                # 有 cache 时用 cache，没有时手动加 system_instruction
-                if self.cache_name:
-                    config = types.GenerateContentConfig(
-                        http_options={'timeout': 300000},
-                        temperature=0.6,
-                        stop_sequences=[self.stop_token, "\n**User - "],
-                        cached_content=self.cache_name,
-                        thinking_config=types.ThinkingConfig(include_thoughts=True)
-                    )
-                else:
-                    # 没有 cache，手动加完整 system prompt
-                    config = types.GenerateContentConfig(
-                        http_options={'timeout': 300000},
-                        temperature=0.6,
-                        stop_sequences=[self.stop_token, "\n**User - "],
-                        system_instruction=self.get_system_instruction(),
-                        thinking_config=types.ThinkingConfig(include_thoughts=True)
-                    )
-                    # 没有 cache 时，prompt 需要包含完整历史
-                    full_text = self.full_history_text + "\n\n" + raw_prompt_text
-                    prompt_contents = parse_multimodal_segment(full_text)
-            
-                # 使用同步 API 的 run_in_executor 或者直接在 async 循环里跑（Google SDK 是同步的）
-                # 新版 google-genai 也是同步的？通常是的。为了不阻塞 Event Loop，我们把它放到线程池里？
-                # 或者 google-genai 是否有 async 方法？是的，client.aio.models.generate_content_stream
-            
-                # 我们需要 client 初始化为 async 模式吗？
-                # google-genai 客户端支持 .aio 属性
-            
-                response = await client.aio.models.generate_content_stream(
-                    model=MODEL,
-                    contents=prompt_contents,
-                    config=config
-                )
-            
-                # 开始流式输出
-                await self.send_message("ai_thought_start", "")  # 通知前端开始
-            
-                output = ""
-                usage_meta = None
-                first_chunk_received = False
-                async for chunk in response:
-                    if not first_chunk_received:
-                        first_chunk_received = True
-                        print("[DEBUG] First chunk received")
-                
-                    # 精细处理 Parts，分离 Reasoning 和 Response
-                    if hasattr(chunk, 'candidates') and chunk.candidates:
-                        for candidate in chunk.candidates:
-                            if hasattr(candidate, 'content') and candidate.content:
-                                for part in candidate.content.parts:
-                                    part_text = part.text or ""
-                                    if not part_text: continue
-                                
-                                    # 处理 Reasoning
-                                    if hasattr(part, 'thought') and part.thought:
-                                        print(f"[Reasoning] {part_text}")
-                                        await self.send_message("ai_thought_chunk", f"> 🧠 {part_text}\n\n")
-                                    else:
-                                        # 普通回复，发送给前端
-                                        output += part_text
-                                        await self.send_message("ai_thought_chunk", part_text)
-                                        await asyncio.sleep(0.01)
+                # 分割：cached_prefix 加 cache_control，buffer 作为增量
+                cached_prefix = self._strip_image_markers(self.full_history_text[:self.cached_length])
+                buffer_text = self._strip_image_markers(self.full_history_text[self.cached_length:])
 
-                    # 最后一个 chunk 可能包含 usage_metadata
-                    if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
-                        usage_meta = chunk.usage_metadata
-            
-                # 打印 Usage 信息
-                if usage_meta:
-                    print(f"[Usage] prompt: {usage_meta.prompt_token_count}, cached: {usage_meta.cached_content_token_count}, output: {usage_meta.candidates_token_count}")
-                    # 自动续期 cache
-                    if self.cache_name:
-                        try: client.caches.update(name=self.cache_name, config={"ttl": "3600s"})
-                        except: pass
-                
-                    # 智能 Cache 轮转：基于 Token 增量
-                    if hasattr(usage_meta, 'cached_content_token_count'):
-                        cached_tokens = usage_meta.cached_content_token_count or 0
-                        buffer_tokens = usage_meta.prompt_token_count - cached_tokens
-                        # 如果 Buffer 超过 10k token，触发刷新
-                        if buffer_tokens > 10000:
-                            print(f"[System] Buffer tokens ({buffer_tokens}) > 10k, rotating cache...")
-                            self._refresh_cache()
-                    # 自动压缩：超过 90 万 token 时触发
-                    print(f"[Compress Check] prompt={usage_meta.prompt_token_count}, _compressing={self._compressing}, threshold=800000")
-                    if usage_meta.prompt_token_count > 800000 and not self._compressing:
-                        self._compressing = True
-                        print(f"[Compress] Token count {usage_meta.prompt_token_count} > 800000, triggering compression...")
-                        threading.Thread(target=self._run_compress, daemon=True).start()
-                    else:
-                        if usage_meta.prompt_token_count <= 900000:
-                            print(f"[Compress Skip] Below threshold")
-                        elif self._compressing:
-                            print(f"[Compress Skip] Already compressing")
-            
+                time_str = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
+                prompt_suffix = f"\n\n-------I am a split line for old consciousness stream and new generated contents-------\n\nInstruction: 1. Above is your old consciousness stream. 2. Please output your thoughts and actions. 3. End with {self.stop_token} when complete.\n\n**Assistant - [{time_str}(Current Time)] - --**\n"
+
+                # 构建 Anthropic 请求
+                system_blocks = [
+                    {
+                        "type": "text",
+                        "text": self.get_system_instruction(),
+                    }
+                ]
+
+                # 构建 messages：cached_prefix 带 cache_control，buffer 不带
+                if cached_prefix:
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": cached_prefix,
+                                    "cache_control": {"type": "ephemeral"}
+                                }
+                            ]
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "I understand. Continuing my consciousness stream."
+                        },
+                        {
+                            "role": "user",
+                            "content": buffer_text + prompt_suffix
+                        }
+                    ]
+                else:
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": self.full_history_text + prompt_suffix
+                        }
+                    ]
+
+                # 构建 API 参数
+                api_params = {
+                    "model": MODEL,
+                    "max_tokens": MAX_TOKENS,
+                    "system": system_blocks,
+                    "messages": messages,
+                    "temperature": 0.6,
+                    "stop_sequences": [self.stop_token, "\n**User - "],
+                }
+
+                # Thinking 模型支持
+                if 'thinking' in MODEL:
+                    api_params["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": THINKING_BUDGET
+                    }
+                    # Anthropic thinking 模型不支持 temperature
+                    del api_params["temperature"]
+
+                # 流式调用
+                await self.send_message("ai_thought_start", "")
+
+                output = ""
+                input_tokens = 0
+                output_tokens = 0
+                cache_creation_tokens = 0
+                cache_read_tokens = 0
+                first_chunk_received = False
+
+                async with client.messages.stream(**api_params) as stream:
+                    async for event in stream:
+                        if not first_chunk_received:
+                            first_chunk_received = True
+                            print("[DEBUG] First chunk received")
+
+                        if event.type == "content_block_delta":
+                            if event.delta.type == "thinking_delta":
+                                thinking_text = event.delta.thinking
+                                print(f"[Reasoning] {thinking_text}")
+                                await self.send_message("ai_thought_chunk", f"> 🧠 {thinking_text}\n\n")
+                            elif event.delta.type == "text_delta":
+                                text = event.delta.text
+                                output += text
+                                await self.send_message("ai_thought_chunk", text)
+                                await asyncio.sleep(0.01)
+
+                        elif event.type == "message_delta":
+                            if hasattr(event, 'usage') and event.usage:
+                                output_tokens = getattr(event.usage, 'output_tokens', 0)
+
+                    # 获取最终 usage
+                    final_message = stream.get_final_message()
+                    if final_message and final_message.usage:
+                        input_tokens = final_message.usage.input_tokens
+                        output_tokens = final_message.usage.output_tokens
+                        cache_creation_tokens = getattr(final_message.usage, 'cache_creation_input_tokens', 0) or 0
+                        cache_read_tokens = getattr(final_message.usage, 'cache_read_input_tokens', 0) or 0
+
+                # 打印 Usage
+                print(f"[Usage] input: {input_tokens}, cache_create: {cache_creation_tokens}, cache_read: {cache_read_tokens}, output: {output_tokens}")
+
+                # 智能缓存边界推进：当 buffer 过大时推进
+                buffer_chars = len(self.full_history_text) - self.cached_length
+                if buffer_chars > 50000:
+                    print(f"[Cache] Buffer ({buffer_chars:,} chars) > 50k, advancing boundary...")
+                    self._rotate_cache_boundary()
+
+                # 自动压缩：总 token 超过阈值
+                total_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
+                print(f"[Compress Check] total_tokens={total_tokens}, _compressing={self._compressing}, threshold=150000")
+                if total_tokens > 150000 and not self._compressing:
+                    self._compressing = True
+                    print(f"[Compress] Token count {total_tokens} > 150k, triggering compression...")
+                    threading.Thread(target=self._run_compress, daemon=True).start()
+
                 # 添加停止标记
                 output += self.stop_token
-            
+
                 # 格式化并添加到意识流
                 formatted_output = f"\n**Assistant - [{time_str}] - --**\n\n{output}\n"
                 self.append_log(formatted_output)
-            
-                # 通知前端结束
+
                 await self.send_message("ai_thought_end", "")
-            
                 print(f"[DEBUG] Inference completed. Output length: {len(output)}")
                 return output
-                
+
             except Exception as e:
-                # Cache 失效时自动重建
                 import traceback
-                if "403" in str(e) or "CachedContent" in str(e):
-                    print("[System] Cache invalid, rebuilding...")
-                    self._refresh_cache()
-            
                 error_msg = f"推理错误: {e}"
-                print(f"[ERROR] Inference failed: {e}")
+                print(f"[ERROR] Inference failed (attempt {attempt+1}/{max_retries}): {e}")
                 print(f"[ERROR] Traceback:\n{traceback.format_exc()}")
                 await self.send_message("error", error_msg)
-            
-                # 让错误进入意识流，以便 Cipher 感知到故障
+
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+
                 time_str = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
                 return f"\nSystem - [Internal] - [{time_str}] - --\n\n[Inference System Error: {e}]\n"
     
@@ -2355,36 +2247,33 @@ HTML_CONTENT = """
 def main():
     """主函数"""
     global client, API_KEY
-    
-    # 检查 API KEY（容器环境不支持交互输入，直接从环境变量读取）
+
     if not API_KEY:
-        print("错误: 未检测到环境变量 GOOGLE_API_KEY")
-        print("请在 Zeabur 控制台设置环境变量 GOOGLE_API_KEY")
+        print("错误: 未检测到环境变量 ANTHROPIC_API_KEY")
+        print("请在 Zeabur 控制台设置环境变量 ANTHROPIC_API_KEY")
         return
-    
-    # 初始化 Google 客户端（通过第三方代理）
-    client = genai.Client(
+
+    # 初始化 Anthropic 客户端
+    client = anthropic.AsyncAnthropic(
         api_key=API_KEY,
-        http_options={
-            'timeout': 300000,
-            'base_url': os.getenv('GEMINI_BASE_URL', 'https://api.gptclubapi.xyz/gemini'),
-        },
+        base_url=BASE_URL,
+        timeout=300.0,
     )
-    
+
     # 确保日志文件存在
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'w', encoding='utf-8') as f:
             f.write(f"[System] LLM Anything Web started at {datetime.now()}\n")
-    
+
     print("="*60)
-    print("✨ LLM Anything Web (Gemini Native Cache)")
+    print("✨ LLM Anything Web (Anthropic SDK + Prompt Caching)")
     print("="*60)
     print(f"模型: {MODEL}")
+    print(f"Base URL: {BASE_URL}")
     print(f"AUTO_RUN: {'开启 (后台持续运行)' if AUTO_RUN else '关闭 (仅网页打开时运行)'}")
     print("="*60)
     print("按 Ctrl+C 退出\n")
-    
-    # 启动服务器 - 支持 PORT 环境变量（Zeabur 等平台会注入）
+
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
 

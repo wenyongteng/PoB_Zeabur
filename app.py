@@ -880,7 +880,7 @@ Use Chinese primarily for output."""
                                 output_tokens = getattr(event.usage, 'output_tokens', 0)
 
                     # 获取最终 usage
-                    final_message = stream.get_final_message()
+                    final_message = await stream.get_final_message()
                     if final_message and final_message.usage:
                         input_tokens = final_message.usage.input_tokens
                         output_tokens = final_message.usage.output_tokens

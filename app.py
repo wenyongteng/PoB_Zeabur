@@ -106,6 +106,7 @@ class PoB:
         # Cache 相关状态
         self.cache_name = None
         self._cache_refreshing = False
+        self._cache_disabled = False  # 缓存 API 不可用时禁用
         self._compressing = False  # 压缩状态
         self.full_history_text = "" # 内存中的完整历史文本副本，用于切片
         self.cached_length = 0      # 已缓存的字符长度
@@ -286,6 +287,7 @@ Use Chinese primarily for output."""
 
     def _refresh_cache(self):
         """后台刷新云端 Cache"""
+        if self._cache_disabled: return  # 缓存 API 不可用，跳过
         if self._cache_refreshing: return  # 防止重复建
         if not self.running: return  # 实例已停止
         self._cache_refreshing = True
@@ -373,13 +375,13 @@ Use Chinese primarily for output."""
                 except: pass
             
         except Exception as e:
-            import traceback
-            print(f"[ERROR] Cache init failed: {e}")
-            print(f"[ERROR] Full traceback:")
-            traceback.print_exc()
-            # 如果失败，降级到非缓存模式
-            self.cache_name = None 
+            print(f"[Cache] 缓存 API 不可用，降级为直接发送模式: {e}")
+            self.cache_name = None
             self.cached_length = 0
+            # 404 / Route not found 说明代理不支持缓存 API，永久禁用
+            if "404" in str(e) or "not found" in str(e).lower() or "Not Found" in str(e):
+                self._cache_disabled = True
+                print("[Cache] 已禁用缓存（代理不支持 cachedContents API）")
         finally:
             self._cache_refreshing = False
 

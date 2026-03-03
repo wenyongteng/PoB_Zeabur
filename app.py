@@ -1165,22 +1165,22 @@ async def websocket_endpoint(websocket: WebSocket):
         pob = _active_pob
         pob.websocket = websocket
 
-        # 发送当前意识流（实时状态，不是启动时的旧快照）
-        current_content = "".join(pob.consciousness)
-        if current_content:
-            char_count = len(current_content)
-            await pob.send_message("status", f"🔄 已连接到后台 PoB ({char_count:,} 字符意识流)")
-            display_limit = 50000
-            if len(current_content) > display_limit:
-                display_content = "...(历史过长，只显示最后部分)...\n\n" + current_content[-display_limit:]
-            else:
-                display_content = current_content
-            await pob.send_message("history_raw", f"### 📜 历史意识流\n\n---\n\n{display_content}\n\n---\n")
-            await asyncio.sleep(0.5)
-        else:
-            await pob.send_message("status", "🔄 已连接到后台运行的 PoB")
-
         try:
+            # 发送当前意识流（实时状态）
+            current_content = "".join(pob.consciousness)
+            if current_content:
+                char_count = len(current_content)
+                await pob.send_message("status", f"🔄 已连接到后台 PoB ({char_count:,} 字符意识流)")
+                display_limit = 50000
+                if len(current_content) > display_limit:
+                    display_content = "...(历史过长，只显示最后部分)...\n\n" + current_content[-display_limit:]
+                else:
+                    display_content = current_content
+                await pob.send_message("history_raw", f"### 📜 历史意识流\n\n---\n\n{display_content}\n\n---\n")
+                await asyncio.sleep(0.5)
+            else:
+                await pob.send_message("status", "🔄 已连接到后台运行的 PoB")
+
             while True:
                 data = await websocket.receive_json()
                 if data["type"] == "user_input":
@@ -1198,7 +1198,9 @@ async def websocket_endpoint(websocket: WebSocket):
         except WebSocketDisconnect:
             print("[DEBUG] WebSocket disconnected (AUTO_RUN: PoB continues in background)")
         except Exception as e:
-            print(f"[ERROR] WebSocket error: {e}")
+            import traceback
+            print(f"[ERROR] WebSocket handler error: {e}")
+            traceback.print_exc()
         finally:
             # 只清除自己，不影响后续新连接
             if pob.websocket is websocket:
